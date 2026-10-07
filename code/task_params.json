@@ -1,0 +1,27 @@
+{
+    "stimulus": {
+        "sr": 192000,
+        "fft_pulse_dur": 1.0,
+        "ramp": 0.004,
+        "f0_low": 4547,
+        "f0_high": 7917,
+        "f0_nogo": 6000,
+        "hct_max_freq": 50000,
+        "amplitude_db": 60,
+        "wn_go_db": 45,
+        "wn_nogo_db": 75,
+        "freq_thresh_pct": 5,
+        "norm": "all"
+    },
+    "timing": {
+        "dt": 10,
+        "pre_stim_dur_ms": 500,
+        "pulse_dur_ms": 50,
+        "n_pulses": 8,
+        "post_stim_dur_ms": 1500,
+        "resp_onset_pulses": 2
+    },
+    "response": {
+        "response_thresh": 0.8
+    }
+}
