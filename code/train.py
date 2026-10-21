@@ -41,15 +41,18 @@ def load_training_params(path=None):
 # ── JIT-compiled train step ────────────────────────────────────────────────────
 
 @jax.jit
-def _train_step(state, xs, ys_target, noise_key):
-    """Single gradient-descent step. Returns (new_state, loss)."""
+def _train_step(state, xs, ys_target, mask, noise_key):
+    """Single gradient-descent step. Returns (new_state, loss).
+
+    mask : (tdim, 1) float array — 1.0 for pre-stim/grace, 5.0 for response period.
+    """
     def loss_fn(params):
         ys_pred, _ = state.apply_fn(
             {'params': params}, xs,
             noise_input=True, noise_rec=True,
             rngs={'noise': noise_key},
         )
-        return jnp.mean((ys_pred - ys_target) ** 2)
+        return jnp.mean(mask * (ys_pred - ys_target) ** 2)
 
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
     return state.apply_gradients(grads=grads), loss
@@ -100,14 +103,14 @@ def _make_grad_mask(params, trainable, n_freq):
 def _make_transfer_train_step(grad_mask):
     """Return a JIT-compiled train step that zeroes gradients for frozen params."""
     @jax.jit
-    def _step(state, xs, ys_target, noise_key):
+    def _step(state, xs, ys_target, mask, noise_key):
         def loss_fn(params):
             ys_pred, _ = state.apply_fn(
                 {'params': params}, xs,
                 noise_input=True, noise_rec=True,
                 rngs={'noise': noise_key},
             )
-            return jnp.mean((ys_pred - ys_target) ** 2)
+            return jnp.mean(mask * (ys_pred - ys_target) ** 2)
 
         loss, grads = jax.value_and_grad(loss_fn)(state.params)
         masked_grads = jax.tree_util.tree_map(
@@ -227,7 +230,8 @@ def transfer_train(task_type, task_list, init_params, trainable='all',
                                 batch_size=batch_size, rng=rng)
         key, noise_key = jax.random.split(key)
         state, loss = train_step(
-            state, jnp.array(trial.x), jnp.array(trial.y), noise_key)
+            state, jnp.array(trial.x), jnp.array(trial.y),
+            jnp.array(trial.mask), noise_key)
 
         if (step + 1) % display_step == 0:
             eval_trial = generate_trials(task_type, task_list, mode='random',
@@ -355,11 +359,15 @@ def setup_training(train_task, task_list, n_steps, k, seed, save_dir=None,
 
     subfolder = (f"{train_task}_{seed}_lr{o_hp['learning_rate']}"
                  f"_bs{t_hp['batch_size']}_noise{m_hp['sigma_x']}_nrnn{m_hp['n_rnn']}")
-    save_path = Path(save_dir or results_dir()) / subfolder
+    save_path = Path(save_dir or results_dir()) / train_task / subfolder
     save_path.mkdir(parents=True, exist_ok=True)
 
+    # Store train_task as a list when it encodes multiple tasks (e.g. 'pure-harmonic')
+    config_train_task = (train_task.split('-')
+                         if isinstance(train_task, str) and '-' in train_task
+                         else train_task)
     config = {
-        'train_task': train_task, 'task_list': task_list,
+        'train_task': config_train_task, 'task_list': task_list,
         'n_in': n_in, 'tdim': tdim, 'stim_on': stim_on,
         'stim_off': stim_off, 'pulse_steps': pulse_steps, 'seed': seed,
         'training': hp, 'task_params': task_params,
@@ -443,7 +451,8 @@ def run_training_loop(state, train_task, task_list, cfg,
                                 batch_size=t_hp['batch_size'], rng=rng)
         key, noise_key = jax.random.split(key)
         state, loss = train_step_fn(
-            state, jnp.array(trial.x), jnp.array(trial.y), noise_key)
+            state, jnp.array(trial.x), jnp.array(trial.y),
+            jnp.array(trial.mask), noise_key)
 
         if (step + 1) % k == 0:
             snap = {
@@ -508,9 +517,20 @@ def evaluate_training(state, snapshots, tasks, cfg,
 
     bsize             = batch_size or 2 * t_hp['batch_size']
     resp_onset_pulses = timing.get('resp_onset_pulses', 2)
-    resp_onset        = stim_on + resp_onset_pulses * pulse_steps
     response_thresh   = cfg['task_params'].get('response', {}).get('response_thresh', 0.5)
-    reaction_steps    = min(int(2000 / dt), tdim - stim_on)
+
+    # Fixed alignment window around go cue, consistent across variable pre-stim batches.
+    # fixed_pre: steps of pre-stim kept before go cue = minimum guaranteed by pre_stim_range_ms.
+    # fixed_post: stim + post-stim steps after go cue.
+    pre_range    = timing.get('pre_stim_range_ms', [timing['pre_stim_dur_ms']] * 2)
+    fixed_pre    = int(min(pre_range) / dt)
+    n_pulses     = timing['n_pulses']
+    stim_dur     = n_pulses * pulse_steps
+    post_steps   = int(timing['post_stim_dur_ms'] / dt)
+    fixed_post   = stim_dur + post_steps
+    aligned_tdim = fixed_pre + fixed_post
+    resp_onset   = fixed_pre + resp_onset_pulses * pulse_steps   # in aligned frame
+    reaction_steps = min(int(2000 / dt), fixed_post)
 
     rng = np.random.default_rng(seed)
     key = jax.random.PRNGKey(seed + 1)
@@ -541,39 +561,69 @@ def evaluate_training(state, snapshots, tasks, cfg,
             ys    = np.array(ys)
             is_go = trial.is_go
 
-            pre   = (ys[:stim_on, :, 0].max(axis=0) if stim_on > 0
-                     else np.zeros(bsize))
-            post  = ys[stim_on : stim_on + reaction_steps, :, 0].max(axis=0)
-            resp  = (post > response_thresh) & (pre < 0.3)
+            # Align to go cue: trim a fixed window around trial.stim_on.
+            actual_so = trial.stim_on
+            ys_aln = ys[actual_so - fixed_pre : actual_so + fixed_post]  # (aligned_tdim, batch, 1)
 
-            hit = float(resp[is_go].mean())   if is_go.any()    else np.nan
-            fa  = float(resp[~is_go].mean())  if (~is_go).any() else np.nan
+            pre  = (ys_aln[:fixed_pre, :, 0].max(axis=0) if fixed_pre > 0
+                    else np.zeros(bsize))
+            post = ys_aln[fixed_pre : fixed_pre + reaction_steps, :, 0].max(axis=0)
+            resp = (post > response_thresh) & (pre < 0.3)
 
-            tgo   = ys[:, is_go,  0].T if is_go.any()    else np.empty((0, tdim))
-            tnogo = ys[:, ~is_go, 0].T if (~is_go).any() else np.empty((0, tdim))
+            hit = float(resp[is_go].mean())  if is_go.any()    else np.nan
+            fa  = float(resp[~is_go].mean()) if (~is_go).any() else np.nan
+
+            tgo   = ys_aln[:, is_go,  0].T if is_go.any()    else np.empty((0, aligned_tdim))
+            tnogo = ys_aln[:, ~is_go, 0].T if (~is_go).any() else np.empty((0, aligned_tdim))
 
             log[f'{t}_hit_rate'].append(hit)
             log[f'{t}_fa_rate'].append(fa)
             log[f'{t}_resp_go'].append(
-                (tgo.mean(axis=0) if len(tgo) > 0 else np.full(tdim, np.nan)).tolist())
+                (tgo.mean(axis=0) if len(tgo) > 0 else np.full(aligned_tdim, np.nan)).tolist())
             log[f'{t}_resp_nogo'].append(
-                (tnogo.mean(axis=0) if len(tnogo) > 0 else np.full(tdim, np.nan)).tolist())
+                (tnogo.mean(axis=0) if len(tnogo) > 0 else np.full(aligned_tdim, np.nan)).tolist())
             log[f'{t}_traces_go'].append(tgo.tolist())
             log[f'{t}_traces_nogo'].append(tnogo.tolist())
             task_strs.append(f'{t}: hit={hit:.2f} FA={fa:.2f}')
 
         print(f'step {snap["step"]:6d}  ' + '  |  '.join(task_strs))
 
-    # Persist the evaluated log into the checkpoint so plot_training_log can load it
+    # Persist the full log into checkpoint.pkl
     ckpt_path = save_path / 'checkpoint.pkl'
     if ckpt_path.exists():
         with open(ckpt_path, 'rb') as f:
             ckpt = pickle.load(f)
-        ckpt['log']        = log
-        ckpt['resp_onset'] = resp_onset
-        ckpt['reaction_steps'] = reaction_steps
+        ckpt['log']              = log
+        ckpt['resp_onset']       = resp_onset
+        ckpt['reaction_steps']   = reaction_steps
+        ckpt['fixed_pre']        = fixed_pre
+        ckpt['aligned_tdim']     = aligned_tdim
         with open(ckpt_path, 'wb') as f:
             pickle.dump(ckpt, f)
+
+    # Also persist per-snapshot eval into each named checkpoint_{step}.pkl
+    for i, snap in enumerate(snapshots):
+        snap_path = save_path / f'checkpoint_{snap["step"]}.pkl'
+        if snap_path.exists():
+            with open(snap_path, 'rb') as f:
+                snap_ckpt = pickle.load(f)
+            snap_ckpt['resp_onset']     = resp_onset
+            snap_ckpt['reaction_steps'] = reaction_steps
+            snap_ckpt['fixed_pre']      = fixed_pre
+            snap_ckpt['aligned_tdim']   = aligned_tdim
+            snap_ckpt['snap_eval'] = {
+                t: {
+                    'hit_rate':   log[f'{t}_hit_rate'][i],
+                    'fa_rate':    log[f'{t}_fa_rate'][i],
+                    'resp_go':    log[f'{t}_resp_go'][i],
+                    'resp_nogo':  log[f'{t}_resp_nogo'][i],
+                    'traces_go':  log[f'{t}_traces_go'][i],
+                    'traces_nogo': log[f'{t}_traces_nogo'][i],
+                }
+                for t in tasks
+            }
+            with open(snap_path, 'wb') as f:
+                pickle.dump(snap_ckpt, f)
 
     return log
 
@@ -594,21 +644,30 @@ def plot_training_log(log, cfg, title='', last_snap_step=None, n_snaps=6):
     -------
     fig : matplotlib Figure
     """
-    stim_on     = cfg['stim_on']
-    stim_off    = cfg['stim_off']
     dt          = cfg['dt']
     k           = cfg['k']
     timing      = cfg['timing']
     pulse_steps = cfg['pulse_steps']
     save_path   = cfg['save_path']
-    response_thresh = cfg['task_params'].get('response', {}).get('response_thresh', 0.5)
-    tdim            = cfg['tdim']
-    reaction_steps  = min(int(2000 / dt), tdim - stim_on)
-    resp_onset      = stim_on + timing.get('resp_onset_pulses', 2) * pulse_steps
+    response_thresh   = cfg['task_params'].get('response', {}).get('response_thresh', 0.5)
+    resp_onset_pulses = timing.get('resp_onset_pulses', 2)
+
+    # Aligned-frame geometry (must match evaluate_training).
+    pre_range    = timing.get('pre_stim_range_ms', [timing['pre_stim_dur_ms']] * 2)
+    fixed_pre    = int(min(pre_range) / dt)
+    n_pulses     = timing['n_pulses']
+    stim_dur     = n_pulses * pulse_steps
+    post_steps   = int(timing['post_stim_dur_ms'] / dt)
+    fixed_post   = stim_dur + post_steps
+    aligned_tdim = fixed_pre + fixed_post
+    stim_on      = fixed_pre                                        # go cue in aligned frame
+    stim_off     = fixed_pre + stim_dur
+    resp_onset   = fixed_pre + resp_onset_pulses * pulse_steps
+    reaction_steps = min(int(2000 / dt), fixed_post)
 
     tasks  = log.get('tasks', [])
     steps  = np.array(log['step'])
-    t_ms   = np.arange(tdim) * dt
+    t_ms   = np.arange(aligned_tdim) * dt
 
     end_idx  = (int(np.searchsorted(steps, last_snap_step))
                 if last_snap_step is not None else len(steps))
@@ -640,21 +699,27 @@ def plot_training_log(log, cfg, title='', last_snap_step=None, n_snaps=6):
         ax.set_ylim(-0.3, 1.3)
         ax.legend(fontsize=7)
 
-    # ── Row 0: hit/FA for all tasks + response curves for first (target) task ─
+    # ── Row 0: hit/FA/correct for all tasks + response curves for first task ──
     ax0 = axes_all[0, 0]
     line_styles = ['-', '--', ':', '-.']
+    task_colors = plt.cm.tab10(np.linspace(0, 0.9, max(len(tasks), 1)))
     for ti, t in enumerate(tasks):
-        ls  = line_styles[ti % len(line_styles)]
-        hr  = np.array(log.get(f'{t}_hit_rate', []))
-        fr  = np.array(log.get(f'{t}_fa_rate',  []))
-        ax0.plot(steps, hr, color='tab:green', lw=2, ls=ls, label=f'Hit — {t}')
-        ax0.plot(steps, fr, color='tab:red',   lw=2, ls=ls, label=f'FA — {t}')
+        ls   = line_styles[ti % len(line_styles)]
+        col  = task_colors[ti]
+        hr   = np.array(log.get(f'{t}_hit_rate', []))
+        fr   = np.array(log.get(f'{t}_fa_rate',  []))
+        corr = (hr + (1.0 - fr)) / 2.0
+        ax0.plot(steps, hr,   color='g',        lw=1.5, ls=ls,     label=f'Hit — {t}',     alpha=0.7)
+        ax0.plot(steps, fr,   color='r',        lw=1.5, ls=ls,     label=f'FA — {t}',      alpha=0.7)
+        ax0.plot(steps, corr, color='b',        lw=2.5, ls=ls,     label=f'Correct — {t}')
+        # shade between hit and correct-rejection to show the two components
+        # ax0.fill_between(steps, fr, hr, color=col, alpha=0.08)
     ax0.axhline(0.5, color='gray', ls='--', lw=1)
     ax0.set_xlabel(f'Training step (eval every {k})')
     ax0.set_ylabel('Rate')
-    ax0.set_title('Hit rate & False alarm rate')
+    ax0.set_title('Hit / FA / Correct rate')
     ax0.set_ylim(-0.05, 1.05)
-    ax0.legend(fontsize=8)
+    ax0.legend(fontsize=7)
 
     if tasks:
         t0 = tasks[0]
@@ -667,7 +732,15 @@ def plot_training_log(log, cfg, title='', last_snap_step=None, n_snaps=6):
 
     # ── Rows 1+: one row per additional (source) task ─────────────────────────
     for row, t in enumerate(tasks[1:], start=1):
-        axes_all[row, 0].axis('off')
+        ax_left = axes_all[row, 0]
+        if row == 1:
+            ax_left.plot(steps, np.array(log['loss']), color='tab:purple', lw=2)
+            ax_left.set_xlabel(f'Training step (eval every {k})')
+            ax_left.set_ylabel('Loss (MSE)')
+            ax_left.set_title('Training loss')
+            ax_left.set_xlim(steps[0] if len(steps) else 0, steps[-1] if len(steps) else 1)
+        else:
+            ax_left.axis('off')
         _draw_response_panel(axes_all[row, 1],
                              log[f'{t}_resp_go'],   f'{t}_traces_go',
                              f'{t} — Go trials')
@@ -795,7 +868,8 @@ def train(tasks, save_dir=None, training_params_path=None,
         ys_target = jnp.array(trial.y)
 
         key, noise_key = jax.random.split(key)
-        state, loss    = _train_step(state, xs, ys_target, noise_key)
+        state, loss    = _train_step(state, xs, ys_target,
+                                     jnp.array(trial.mask), noise_key)
 
         if (step + 1) % t_hp['display_step'] == 0 or step == 0:
             perfs    = _evaluate(state, tasks, task_params, t_hp['batch_size'], rng)

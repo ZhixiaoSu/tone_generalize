@@ -1,0 +1,20 @@
+{
+  "n_alpha": 21,
+  "n_trials": 128,
+  "n_iters": 8000,
+  "lr": 0.01,
+  "tol": 1e-6,
+  "unique_tol": 0.01,
+  "phases": [
+    ["fixation", null],
+    ["pulse_on",  1],
+    ["pulse_on",  2],
+    ["pulse_on",  3],
+    ["pulse_on",  4],
+    ["pulse_on",  5],
+    ["pulse_on",  6],
+    ["pulse_on",  7],
+    ["pulse_on",  8],
+    ["stim_off",  null]
+  ]
+}

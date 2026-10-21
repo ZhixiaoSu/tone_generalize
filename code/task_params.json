@@ -16,6 +16,7 @@
     "timing": {
         "dt": 10,
         "pre_stim_dur_ms": 500,
+        "pre_stim_range_ms": [200, 800],
         "pulse_dur_ms": 50,
         "n_pulses": 8,
         "post_stim_dur_ms": 1500,

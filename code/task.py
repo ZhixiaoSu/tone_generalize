@@ -273,12 +273,25 @@ def generate_trials(task_type, task_list, mode='random', batch_size=32,
     t      = params['timing']
     dt     = t['dt']
 
-    stim_on           = int(t['pre_stim_dur_ms'] / dt)
     n_pulses          = t['n_pulses']
     pulse_steps       = max(1, int(np.ceil(t['pulse_dur_ms'] / dt)))
-    stim_off          = stim_on + n_pulses * pulse_steps
-    tdim              = stim_off + int(t['post_stim_dur_ms'] / dt)
+    stim_dur          = n_pulses * pulse_steps
     resp_onset_pulses = t.get('resp_onset_pulses', 2)
+
+    # Timing: jitter in random mode, nominal fixed values in test mode.
+    post_stim_steps = int(t['post_stim_dur_ms'] / dt)
+
+    if mode == 'random':
+        pre_range = t.get('pre_stim_range_ms', [t['pre_stim_dur_ms']] * 2)
+        stim_on = int(rng.uniform(*pre_range) / dt)
+        # tdim fixed at maximum pre-stim + fixed stim + fixed post-stim
+        tdim = int(max(pre_range) / dt) + stim_dur + post_stim_steps
+    else:
+        stim_on = int(t['pre_stim_dur_ms'] / dt)
+        tdim    = stim_on + stim_dur + post_stim_steps
+
+    stim_off  = stim_on + stim_dur
+    trial_end = stim_off + post_stim_steps  # last meaningful step; tail of tdim is silent
 
     grid_hz, vectors = get_stimulus_vectors(task_list, params)
     n_freq = len(grid_hz)
@@ -304,7 +317,7 @@ def generate_trials(task_type, task_list, mode='random', batch_size=32,
             pulse_idx = (step - stim_on) // pulse_steps
             lbl = go_labels[pulse_idx % len(go_labels)]
             trial.x[step, i, :n_freq] = vectors[lbl]
-        trial.y[stim_on + resp_onset_pulses * pulse_steps:, i, 0] = 1.0
+        trial.y[stim_on + resp_onset_pulses * pulse_steps :, i, 0] = 1.0
 
     def _fill_nogo(i, label):
         trial.x[stim_on:stim_off, i, :n_freq] = vectors[label]
@@ -340,13 +353,20 @@ def generate_trials(task_type, task_list, mode='random', batch_size=32,
     else:
         raise ValueError(f"Unknown mode '{mode}'. Choose 'random' or 'test'.")
 
-    trial.stim_on  = stim_on
-    trial.stim_off = stim_off
-    trial.tdim     = tdim
-    trial.epochs   = {
-        'pre_stim':  (0,        stim_on),
-        'stim':      (stim_on,  stim_off),
-        'post_stim': (stim_off, tdim),
+    # Loss mask: 1.0 everywhere, 5.0 during the response period (after grace).
+    # Shape (tdim, 1) broadcasts over (tdim, batch, 1) ys arrays.
+    mask = np.ones((tdim, 1, 1), dtype='float32')
+    mask[stim_on + resp_onset_pulses * pulse_steps:, 0, 0] = 5.0
+    trial.mask = mask
+
+    trial.stim_on   = stim_on
+    trial.stim_off  = stim_off
+    trial.trial_end = trial_end
+    trial.tdim      = tdim
+    trial.epochs    = {
+        'pre_stim':  (0,         stim_on),
+        'stim':      (stim_on,   stim_off),
+        'post_stim': (stim_off,  trial_end),
     }
     trial.grid_hz = grid_hz
     trial.labels  = labels
