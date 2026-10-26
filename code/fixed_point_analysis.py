@@ -50,6 +50,38 @@ def _make_scene(ax):
                 aspectmode='data')
 
 
+def _fp3d(fig, x, y, z, fill_col, ec, sz, name, stable,
+          showlegend=True, opacity=1.0, row=None, col=None):
+    """Add a Plotly 3D fixed-point marker using the double-circle trick.
+
+    Plotly WebGL does not render marker.line.width in 3D — only the legend swatch.
+    Workaround: add a slightly larger background circle filled with the edge colour,
+    then paint the foreground circle (condition/pulse colour) on top.
+    Unstable FPs get an additional black × overlay.
+    """
+    kw = dict(row=row, col=col) if row is not None else {}
+    # 1) background circle → edge colour, +5 pixels larger, hidden from legend
+    fig.add_trace(go.Scatter3d(
+        x=x, y=y, z=z, mode='markers',
+        marker=dict(color=ec, size=sz + 5, symbol='circle', opacity=opacity),
+        showlegend=False,
+    ), **kw)
+    # 2) foreground circle → fill colour
+    fig.add_trace(go.Scatter3d(
+        x=x, y=y, z=z, mode='markers',
+        marker=dict(color=fill_col, size=sz, symbol='circle', opacity=opacity),
+        name=name, showlegend=showlegend,
+    ), **kw)
+    if not stable:
+        # 3) black × overlay for unstable FPs
+        fig.add_trace(go.Scatter3d(
+            x=x, y=y, z=z, mode='markers',
+            marker=dict(color='black', size=max(sz - 3, 3), symbol='x',
+                        line=dict(color='black', width=1.5), opacity=opacity),
+            showlegend=False,
+        ), **kw)
+
+
 def _compute_flow_field(pca, params, x_frozen, alpha, h_segment, n_grid=6, pad_std=0.5):
     """
     Evaluate the RNN velocity field Δh on a grid around the given trajectory segment.
@@ -109,6 +141,8 @@ def analyse(ckpt_path: Path, args) -> None:
     train_tasks = config.get('train_task', config.get('task_type', 'pure'))
     if isinstance(train_tasks, str):
         train_tasks = [train_tasks]
+    if args.task is not None:
+        train_tasks = [t.strip() for t in args.task.split(',')]
 
     with open(ckpt_path, 'rb') as f:
         ckpt = pickle.load(f)
@@ -228,7 +262,7 @@ def analyse(ckpt_path: Path, args) -> None:
         NOGO_COL = _pc('tab:orange')
 
         # ── helpers ───────────────────────────────────────────────────────────────
-        COND_MKR     = {'go': 'o', 'nogo': '^'}
+        COND_MKR     = {'go': '^', 'nogo': '^'}
         STABLE_MKR   = 'o'
         UNSTABLE_MKR = 'x'
 
@@ -240,12 +274,14 @@ def analyse(ckpt_path: Path, args) -> None:
                 p = pca.transform(hs[:, i, :])
                 ax.plot(p[:, 0], p[:, 1], p[:, 2], color='tab:orange', alpha=a, lw=lw)
 
-        def _scatter_fp(ax, px, py, pz, stable, color):
+        def _scatter_fp(ax, px, py, pz, stable, color, edge_color='black'):
             if stable:
                 ax.scatter(px, py, pz, s=120, marker=STABLE_MKR,
-                           color=color, edgecolors='black', linewidths=0.8, depthshade=False)
+                           color=color, edgecolors=edge_color, linewidths=0.8, depthshade=False)
             else:
-                ax.scatter(px, py, pz, s=80, marker=UNSTABLE_MKR, color=color, depthshade=False)
+                ax.scatter(px, py, pz, s=120, marker=STABLE_MKR,
+                           color=color, edgecolors=edge_color, linewidths=1.2, depthshade=False)
+                ax.scatter(px, py, pz, s=80, marker='x', color='black', linewidths=1.5, depthshade=False)
 
         def _set_labels(ax, title):
             ax.set_title(title, fontsize=10)
@@ -277,7 +313,8 @@ def analyse(ckpt_path: Path, args) -> None:
                 if len(fp['h']) == 0: continue
                 p = pca.transform(fp['h'])
                 for (px, py, pz, stable) in zip(p[:, 0], p[:, 1], p[:, 2], fp['is_stable']):
-                    _scatter_fp(ax, px, py, pz, stable, color)
+                    _scatter_fp(ax, px, py, pz, stable, color,
+                                edge_color='tab:blue' if cond == 'go' else 'tab:orange')
             _set_labels(ax, key)
 
         if pulse_results:
@@ -296,7 +333,8 @@ def analyse(ckpt_path: Path, args) -> None:
                     if len(fp['h']) == 0: continue
                     p = pca.transform(fp['h'])
                     for (px, py, pz, stable) in zip(p[:, 0], p[:, 1], p[:, 2], fp['is_stable']):
-                        _scatter_fp(ax, px, py, pz, stable, color_p)
+                        _scatter_fp(ax, px, py, pz, stable, color_p,
+                                    edge_color='tab:blue' if cond == 'go' else 'tab:orange')
             sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm); sm.set_array([])
             fig.colorbar(sm, ax=ax, shrink=0.5, pad=0.12, label='Pulse #').set_ticks(range(1, n_pulses_found + 1))
             _set_labels(ax, f'pulse_on 1–{n_pulses_found}')
@@ -304,8 +342,9 @@ def analyse(ckpt_path: Path, args) -> None:
         fig.legend(handles=[
             mpatches.Patch(color='tab:blue',   label='Go'),
             mpatches.Patch(color='tab:orange', label='No-Go'),
-            plt.Line2D([0], [0], marker=STABLE_MKR,   color='k', linestyle='None', markersize=10, markeredgecolor='black', label='Stable FP'),
-            plt.Line2D([0], [0], marker=UNSTABLE_MKR, color='k', linestyle='None', markersize=10, label='Unstable FP'),
+            plt.Line2D([0], [0], marker=STABLE_MKR, color='tab:blue',   linestyle='None', markersize=10, markeredgecolor='tab:blue', label='Stable FP (Go)'),
+            plt.Line2D([0], [0], marker=STABLE_MKR, color='tab:orange', linestyle='None', markersize=10, markeredgecolor='tab:orange', label='Stable FP (No-Go)'),
+            plt.Line2D([0], [0], marker='x',         color='black',      linestyle='None', markersize=10, markeredgewidth=1.5,    label='Unstable FP (+ ×)'),
         ], loc='lower center', ncol=4, fontsize=9, bbox_to_anchor=(0.5, -0.02))
         fig.suptitle(f'Fixed points — {task_type}  |  step {ckpt["step"]}', fontsize=12)
         plt.tight_layout()
@@ -332,14 +371,13 @@ def analyse(ckpt_path: Path, args) -> None:
                                            marker=dict(color=col, size=3, opacity=0.7), name=f'{key} {cond}'))
                 if cond in res['conds'] and len(res['conds'][cond]['h']) > 0:
                     fp = res['conds'][cond]; pfp = pca.transform(fp['h']); s = fp['is_stable']
+                    ec = GO_COL if cond == 'go' else NOGO_COL
                     if s.any():
-                        fig.add_trace(go.Scatter3d(x=pfp[s,0], y=pfp[s,1], z=pfp[s,2], mode='markers',
-                                                   marker=dict(color=col, size=10, symbol='circle'),
-                                                   name=f'Stable FP {key} {cond}'))
+                        _fp3d(fig, pfp[s,0], pfp[s,1], pfp[s,2], col, ec, 10,
+                              f'Stable FP {key} {cond}', stable=True)
                     if (~s).any():
-                        fig.add_trace(go.Scatter3d(x=pfp[~s,0], y=pfp[~s,1], z=pfp[~s,2], mode='markers',
-                                                   marker=dict(color=col, size=7, symbol='x'),
-                                                   name=f'Unstable FP {key} {cond}'))
+                        _fp3d(fig, pfp[~s,0], pfp[~s,1], pfp[~s,2], col, ec, 7,
+                              f'Unstable FP {key} {cond}', stable=False)
             fig.update_layout(title=f'Fixed points — {key}', scene=_make_scene(axis_labels),
                               height=600, paper_bgcolor='white')
             fname = key.replace(' ', '_').replace('/', '-')
@@ -358,14 +396,13 @@ def analyse(ckpt_path: Path, args) -> None:
                                                name=f'{key} {cond}'))
                     if cond in res['conds'] and len(res['conds'][cond]['h']) > 0:
                         fp = res['conds'][cond]; pfp = pca.transform(fp['h']); s = fp['is_stable']
+                        ec = GO_COL if cond == 'go' else NOGO_COL
                         if s.any():
-                            fig.add_trace(go.Scatter3d(x=pfp[s,0], y=pfp[s,1], z=pfp[s,2], mode='markers',
-                                                       marker=dict(color=col_str, size=10, symbol='circle'),
-                                                       name=f'Stable FP {key}'))
+                            _fp3d(fig, pfp[s,0], pfp[s,1], pfp[s,2], col_str, ec, 10,
+                                  f'Stable FP {key} {cond}', stable=True)
                         if (~s).any():
-                            fig.add_trace(go.Scatter3d(x=pfp[~s,0], y=pfp[~s,1], z=pfp[~s,2], mode='markers',
-                                                       marker=dict(color=col_str, size=7, symbol='x'),
-                                                       name=f'Unstable FP {key}'))
+                            _fp3d(fig, pfp[~s,0], pfp[~s,1], pfp[~s,2], col_str, ec, 7,
+                                  f'Unstable FP {key} {cond}', stable=False)
             fig.update_layout(title=f'Fixed points — pulse_on 1-{len(pulse_results)}',
                               scene=_make_scene(axis_labels), height=600, paper_bgcolor='white')
             _save_show_plotly(fig, out_dir / f'fp_overview_pulses_{ckpt["step"]}.html')
@@ -440,7 +477,7 @@ def analyse(ckpt_path: Path, args) -> None:
             titles3 = ['Go + No-Go', 'Go only', 'No-Go only']
             show3   = [('go', 'nogo'), ('go',), ('nogo',)]
             ls_c    = {'go': '-',  'nogo': '--'}
-            mkr_c   = {'go': 'o', 'nogo': '^'}
+            mkr_c   = {'go': '^', 'nogo': '^'}
 
             for phase, pulse_num in points:
                 key = phase_label(phase, pulse_num)
@@ -472,9 +509,15 @@ def analyse(ckpt_path: Path, args) -> None:
                             p = fp_c[cond]; stable = fp_c[cond+'_stable']
                             for (px, py, pz, s) in zip(p[:, 0], p[:, 1], p[:, 2], stable):
                                 if s:
-                                    ax.scatter(px, py, pz, s=140, marker='o', color=color, edgecolors='black', linewidths=1.2, depthshade=False, zorder=6)
+                                    ax.scatter(px, py, pz, s=140, marker='o', color=color,
+                                               edgecolors='tab:blue' if cond == 'go' else 'tab:orange',
+                                               linewidths=1.2, depthshade=False, zorder=6)
                                 else:
-                                    ax.scatter(px, py, pz, s=100, marker='x', color=color, depthshade=False, zorder=6)
+                                    ax.scatter(px, py, pz, s=140, marker='o', color=color,
+                                               edgecolors='tab:blue' if cond == 'go' else 'tab:orange',
+                                               linewidths=1.2, depthshade=False, zorder=6)
+                                    ax.scatter(px, py, pz, s=100, marker='x', color='black',
+                                               linewidths=1.5, depthshade=False, zorder=7)
 
             for ax, t in zip(axes3, titles3):
                 ax.set_xlabel(f'PC1 ({var_exp[0]:.1f}%)', labelpad=4)
@@ -486,10 +529,11 @@ def analyse(ckpt_path: Path, args) -> None:
             axes3[0].legend(handles=[
                 plt.Line2D([0], [0], color='k', lw=1.8, ls='-',  label='Go (mean)'),
                 plt.Line2D([0], [0], color='k', lw=1.8, ls='--', label='No-Go (mean)'),
-                plt.Line2D([0], [0], color='k', marker='o', linestyle='None', markersize=7, markeredgecolor='black', label='Start (Go)'),
+                plt.Line2D([0], [0], color='k', marker='^', linestyle='None', markersize=7, markeredgecolor='black', label='Start (Go)'),
                 plt.Line2D([0], [0], color='k', marker='^', linestyle='None', markersize=7, markeredgecolor='black', label='Start (No-Go)'),
-                plt.Line2D([0], [0], color='k', marker='o', linestyle='None', markersize=10, markeredgecolor='black', label='Stable FP'),
-                plt.Line2D([0], [0], color='k', marker='x', linestyle='None', markersize=10, label='Unstable FP'),
+                plt.Line2D([0], [0], color='tab:blue',   marker='o', linestyle='None', markersize=10, markeredgecolor='tab:blue', label='Stable FP (Go)'),
+                plt.Line2D([0], [0], color='tab:orange', marker='o', linestyle='None', markersize=10, markeredgecolor='tab:orange', label='Stable FP (No-Go)'),
+                plt.Line2D([0], [0], color='black',      marker='x', linestyle='None', markersize=10, markeredgewidth=1.5,    label='Unstable FP (+ ×)'),
             ], fontsize=8, loc='upper left')
             fig.suptitle(f'Frozen dynamics in PCA space — {task_type}  |  step {ckpt["step"]}  |  freeze_dur={args.freeze_dur} ms', fontsize=11)
             plt.tight_layout()
@@ -528,14 +572,13 @@ def analyse(ckpt_path: Path, args) -> None:
                                                marker=dict(color=col_str, size=8), name=f'{lbl} start'))
                     if cond in fp_by:
                         pfp = fp_by[cond]; s = fp_by[cond+'_stable']
+                        ec = GO_COL if cond == 'go' else NOGO_COL
                         if s.any():
-                            fig.add_trace(go.Scatter3d(x=pfp[s,0], y=pfp[s,1], z=pfp[s,2], mode='markers',
-                                                       marker=dict(color=col_str, size=9, symbol='circle'),
-                                                       name=f'Stable FP {lbl}'))
+                            _fp3d(fig, pfp[s,0], pfp[s,1], pfp[s,2], col_str, ec, 9,
+                                  f'Stable FP {lbl}', stable=True)
                         if (~s).any():
-                            fig.add_trace(go.Scatter3d(x=pfp[~s,0], y=pfp[~s,1], z=pfp[~s,2], mode='markers',
-                                                       marker=dict(color=col_str, size=6, symbol='x'),
-                                                       name=f'Unstable FP {lbl}'))
+                            _fp3d(fig, pfp[~s,0], pfp[~s,1], pfp[~s,2], col_str, ec, 6,
+                                  f'Unstable FP {lbl}', stable=False)
             fig.update_layout(title=f'Frozen dynamics — {panel_title}', scene=_make_scene(scene_labels),
                               height=600, paper_bgcolor='white')
             _save_show_plotly(fig, out_dir / f'{fname_base}_{ckpt["step"]}.html')
@@ -555,9 +598,14 @@ def analyse(ckpt_path: Path, args) -> None:
                 z = np.full(len(fps), pulse_num)
                 if stable.any():
                     ax.scatter(fps[stable, 0], fps[stable, 1], z[stable], s=120, marker=mkr, color=color,
-                               edgecolors='black', linewidths=0.9, depthshade=False)
+                               edgecolors='tab:blue' if cond == 'go' else 'tab:orange',
+                               linewidths=0.9, depthshade=False)
                 if (~stable).any():
-                    ax.scatter(fps[~stable, 0], fps[~stable, 1], z[~stable], s=80, marker='x', color=color, depthshade=False)
+                    ax.scatter(fps[~stable, 0], fps[~stable, 1], z[~stable], s=120, marker=mkr,
+                               color=color, edgecolors='tab:blue' if cond == 'go' else 'tab:orange',
+                               linewidths=0.9, depthshade=False)
+                    ax.scatter(fps[~stable, 0], fps[~stable, 1], z[~stable], s=80, marker='x',
+                               color='black', linewidths=1.5, depthshade=False)
         ax.set_xlabel(f'PC1 ({var_exp[0]:.1f}%)', labelpad=4)
         ax.set_ylabel(f'PC2 ({var_exp[1]:.1f}%)', labelpad=4)
         ax.set_zlabel('Pulse #', labelpad=4)
@@ -565,10 +613,9 @@ def analyse(ckpt_path: Path, args) -> None:
         sm = plt.cm.ScalarMappable(cmap=cmap_fp, norm=norm_fp); sm.set_array([])
         fig.colorbar(sm, ax=ax, shrink=0.5, pad=0.12, label='Pulse #').set_ticks(range(1, args.n_pulses + 1))
         ax.legend(handles=[
-            plt.Line2D([0], [0], color='k', marker='o', linestyle='None', markersize=8, markeredgecolor='black', label='Go stable'),
-            plt.Line2D([0], [0], color='k', marker='x', linestyle='None', markersize=8, label='Go unstable'),
-            plt.Line2D([0], [0], color='k', marker='^', linestyle='None', markersize=8, markeredgecolor='black', label='No-Go stable'),
-            plt.Line2D([0], [0], color='k', marker='x', linestyle='None', markersize=8, label='No-Go unstable'),
+            plt.Line2D([0], [0], color='k', marker='o', linestyle='None', markersize=8, markeredgecolor='tab:blue',   label='Go stable'),
+            plt.Line2D([0], [0], color='k', marker='^', linestyle='None', markersize=8, markeredgecolor='tab:orange', label='No-Go stable'),
+            plt.Line2D([0], [0], color='black', marker='x', linestyle='None', markersize=8, markeredgewidth=1.5, label='Unstable FP (+ ×)'),
         ], fontsize=9, loc='upper left')
         ax.set_title(f'Fixed points across pulses — {task_type}  |  step {ckpt["step"]}', fontsize=11)
         plt.tight_layout()
@@ -587,14 +634,13 @@ def analyse(ckpt_path: Path, args) -> None:
                 fps = pca.transform(res['conds'][cond]['h'])
                 s   = res['conds'][cond]['is_stable']
                 z   = np.full(len(fps), float(pulse_num))
+                ec = GO_COL if cond == 'go' else NOGO_COL
                 if s.any():
-                    fig.add_trace(go.Scatter3d(x=fps[s,0], y=fps[s,1], z=z[s], mode='markers',
-                                               marker=dict(color=col_str, size=sz_s, symbol='circle'),
-                                               name=f'Stable {cond} P{pulse_num}'))
+                    _fp3d(fig, fps[s,0], fps[s,1], z[s], col_str, ec, sz_s,
+                          f'Stable {cond} P{pulse_num}', stable=True)
                 if (~s).any():
-                    fig.add_trace(go.Scatter3d(x=fps[~s,0], y=fps[~s,1], z=z[~s], mode='markers',
-                                               marker=dict(color=col_str, size=sz_u, symbol='x'),
-                                               name=f'Unstable {cond} P{pulse_num}'))
+                    _fp3d(fig, fps[~s,0], fps[~s,1], z[~s], col_str, ec, sz_u,
+                          f'Unstable {cond} P{pulse_num}', stable=False)
         fig.update_layout(title='Fixed points: PC1 vs PC2 vs pulse#',
                           scene=dict(xaxis_title=f'PC1 ({var_exp[0]:.1f}%)', yaxis_title=f'PC2 ({var_exp[1]:.1f}%)',
                                      zaxis_title='Pulse #', aspectmode='manual', aspectratio=dict(x=1, y=1, z=0.7)),
@@ -681,8 +727,16 @@ def analyse(ckpt_path: Path, args) -> None:
                     if cond in fp_cs:
                         p = fp_cs[cond]; stable = fp_cs[cond+'_stable']
                         for (px, py, pz, s) in zip(p[:, 0], p[:, 1], p[:, 2], stable):
-                            if s: ax.scatter(px, py, pz, s=140, marker='o', color=color, edgecolors='black', linewidths=1.2, depthshade=False, zorder=6)
-                            else: ax.scatter(px, py, pz, s=100, marker='x', color=color, depthshade=False, zorder=6)
+                            if s:
+                                ax.scatter(px, py, pz, s=140, marker='o', color=color,
+                                           edgecolors='tab:blue' if cond == 'go' else 'tab:orange',
+                                           linewidths=1.2, depthshade=False, zorder=6)
+                            else:
+                                ax.scatter(px, py, pz, s=140, marker='o', color=color,
+                                           edgecolors='tab:blue' if cond == 'go' else 'tab:orange',
+                                           linewidths=1.2, depthshade=False, zorder=6)
+                                ax.scatter(px, py, pz, s=100, marker='x', color='black',
+                                           linewidths=1.5, depthshade=False, zorder=7)
         for ax, t in zip(axes_s, ['Go + No-Go', 'Go only', 'No-Go only']):
             ax.set_xlabel(f'PC1 ({var_exp[0]:.1f}%)', labelpad=4)
             ax.set_ylabel(f'PC2 ({var_exp[1]:.1f}%)', labelpad=4)
@@ -693,10 +747,11 @@ def analyse(ckpt_path: Path, args) -> None:
         axes_s[0].legend(handles=[
             plt.Line2D([0], [0], color='k', lw=1.8, ls='-',  label='Go (mean)'),
             plt.Line2D([0], [0], color='k', lw=1.8, ls='--', label='No-Go (mean)'),
-            plt.Line2D([0], [0], color='k', marker='o', linestyle='None', markersize=7, markeredgecolor='black', label='Start (Go)'),
+            plt.Line2D([0], [0], color='k', marker='^', linestyle='None', markersize=7, markeredgecolor='black', label='Start (Go)'),
             plt.Line2D([0], [0], color='k', marker='^', linestyle='None', markersize=7, markeredgecolor='black', label='Start (No-Go)'),
-            plt.Line2D([0], [0], color='k', marker='o', linestyle='None', markersize=10, markeredgecolor='black', label='Stable FP'),
-            plt.Line2D([0], [0], color='k', marker='x', linestyle='None', markersize=10, label='Unstable FP'),
+            plt.Line2D([0], [0], color='tab:blue',   marker='o', linestyle='None', markersize=10, markeredgecolor='tab:blue', label='Stable FP (Go)'),
+            plt.Line2D([0], [0], color='tab:orange', marker='o', linestyle='None', markersize=10, markeredgecolor='tab:orange', label='Stable FP (No-Go)'),
+            plt.Line2D([0], [0], color='black',      marker='x', linestyle='None', markersize=10, markeredgewidth=1.5,    label='Unstable FP (+ ×)'),
         ], fontsize=8, loc='upper left')
         fig.suptitle(f'Silent-input dynamics in PCA space — {task_type}  |  step {ckpt["step"]}  |  freeze_dur={args.freeze_dur} ms', fontsize=11)
         plt.tight_layout()
@@ -736,14 +791,13 @@ def analyse(ckpt_path: Path, args) -> None:
                                                marker=dict(color=col_str, size=10), name=f'{lbl} start'))
                     if cond in fp_by:
                         pfp = fp_by[cond]; s = fp_by[cond+'_stable']
+                        ec = GO_COL if cond == 'go' else NOGO_COL
                         if s.any():
-                            fig.add_trace(go.Scatter3d(x=pfp[s,0], y=pfp[s,1], z=pfp[s,2], mode='markers',
-                                                       marker=dict(color=col_str, size=9, symbol='circle'),
-                                                       name=f'Stable FP {lbl}'))
+                            _fp3d(fig, pfp[s,0], pfp[s,1], pfp[s,2], col_str, ec, 9,
+                                  f'Stable FP {lbl}', stable=True)
                         if (~s).any():
-                            fig.add_trace(go.Scatter3d(x=pfp[~s,0], y=pfp[~s,1], z=pfp[~s,2], mode='markers',
-                                                       marker=dict(color=col_str, size=6, symbol='x'),
-                                                       name=f'Unstable FP {lbl}'))
+                            _fp3d(fig, pfp[~s,0], pfp[~s,1], pfp[~s,2], col_str, ec, 6,
+                                  f'Unstable FP {lbl}', stable=False)
             fig.update_layout(title=f'Silent-input dynamics — {panel_title}', scene=_make_scene(scene_labels),
                               height=600, paper_bgcolor='white')
             _save_show_plotly(fig, out_dir / f'{fname_base}_{ckpt["step"]}.html')
@@ -830,19 +884,13 @@ def analyse(ckpt_path: Path, args) -> None:
                     fp = res['conds'][cond]
                     p  = pca.transform(fp['h'])
                     s  = fp['is_stable']
+                    ec = GO_COL if cond == 'go' else NOGO_COL
                     if s.any():
-                        fig.add_trace(go.Scatter3d(
-                            x=p[s, 0], y=p[s, 1], z=p[s, 2], mode='markers',
-                            marker=dict(color=col_traj, size=14, symbol='circle',
-                                        line=dict(color='black', width=2)),
-                            name=f'Stable FP ({cond})',
-                        ), row=1, col=col_idx)
+                        _fp3d(fig, p[s, 0], p[s, 1], p[s, 2], col_traj, ec, 14,
+                              f'Stable FP ({cond})', stable=True, row=1, col=col_idx)
                     if (~s).any():
-                        fig.add_trace(go.Scatter3d(
-                            x=p[~s, 0], y=p[~s, 1], z=p[~s, 2], mode='markers',
-                            marker=dict(color=col_traj, size=8, symbol='x'),
-                            name=f'Unstable FP ({cond})',
-                        ), row=1, col=col_idx)
+                        _fp3d(fig, p[~s, 0], p[~s, 1], p[~s, 2], col_traj, ec, 8,
+                              f'Unstable FP ({cond})', stable=False, row=1, col=col_idx)
 
             scene_kw = dict(xaxis_title=axis_labels[0], yaxis_title=axis_labels[1],
                             zaxis_title=axis_labels[2], aspectmode='data')
@@ -880,6 +928,7 @@ def main():
     p.add_argument('--unique-tol', type=float, default=1e-3,  help='L2 deduplication distance (default: 1e-3)')
     p.add_argument('--freeze-dur', type=int,   default=2000,  help='Frozen dynamics duration in ms (default: 2000)')
     p.add_argument('--n-pulses',   type=int,   default=8,     help='Number of pulses to analyse (default: 8)')
+    p.add_argument('--task',       type=str,   default=None,  help='Override task(s) to analyse, comma-separated (e.g. pure,harmonic); default: use training task from config')
     p.add_argument('--show',       action='store_true',       help='Open Plotly plots in browser')
 
     # First pass: pick up --params only, then inject its values as new defaults

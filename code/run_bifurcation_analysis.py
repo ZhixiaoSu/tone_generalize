@@ -39,16 +39,25 @@ CHECKPOINTS = [
     #                '/harmonic_0_lr5e-05_bs128_noise0.5_nrnn128/checkpoint_init.pkl',
     #  'wn', 'harmonic'),
     
-    (results_dir / 'transfer_pure_to_harmonic/context+sensory/harmonic/harmonic_0_lr0.0001_bs64_noise0.1_nrnn128/checkpoint_init.pkl',
-     'pure', 'harmonic'),
-    (results_dir / 'transfer_pure_to_harmonic/context+sensory/harmonic/harmonic_0_lr0.0001_bs64_noise0.1_nrnn128/checkpoint_10000.pkl',
-     'pure', 'harmonic'),
+    # (results_dir / 'transfer_pure_to_harmonic/context+sensory/harmonic/harmonic_0_lr0.0001_bs64_noise0.1_nrnn128/checkpoint_init.pkl',
+    #  'pure', 'harmonic'),
+    # (results_dir / 'transfer_pure_to_harmonic/context+sensory/harmonic/harmonic_0_lr0.0001_bs64_noise0.1_nrnn128/checkpoint_10000.pkl',
+    #  'pure', 'harmonic'),
 
-    (results_dir / 'pure-harmonic/pure-harmonic_0_lr0.0001_bs64_noise0.1_nrnn128/checkpoint_8000.pkl',
-     'pure', 'harmonic'),
+    # (results_dir / 'pure-harmonic/pure-harmonic_0_lr0.0001_bs64_noise0.1_nrnn128/checkpoint_8000.pkl',
+    #  'pure', 'harmonic'),
 
-    (results_dir / 'pure-harmonic/pure-harmonic_0_lr0.0001_bs64_noise0.1_nrnn128/checkpoint_20000.pkl',
-     'pure', 'harmonic'),
+    # (results_dir / 'pure-harmonic/pure-harmonic_0_lr0.0001_bs64_noise0.1_nrnn128/checkpoint_20000.pkl',
+    #  'pure', 'harmonic'),
+    # (results_dir / 'transfer_pure_to_harmonic/context+sensory/harmonic/harmonic_0_lr0.0001_bs64_noise0.1_nrnn128/checkpoint_10000.pkl',
+    #  'pure', 'harmonic'),
+    # (results_dir / 'transfer_pure_to_harmonic/all/harmonic/harmonic_0_lr0.0001_bs64_noise0.1_nrnn128_src4000/checkpoint_10000.pkl',
+    #  'pure', 'harmonic'),
+    # (results_dir / 'transfer_pure_to_harmonic/context+sensory/harmonic/harmonic_0_lr0.0001_bs64_noise0.1_nrnn128/checkpoint_10000.pkl',
+    #  'pure', 'harmonic'),
+    (results_dir / 'transfer_wn_to_harmonic/all/harmonic/harmonic_0_lr0.0001_bs64_noise0.1_nrnn128_src4000/checkpoint_10000.pkl',
+      'wn', 'harmonic'),
+  
 ]
 
 # ── run ───────────────────────────────────────────────────────────────────────

@@ -36,10 +36,10 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.stats import rankdata
+from scipy.stats import norm, rankdata
 
 sys.path.insert(0, str(Path(__file__).parent))
-from task import generate_trials
+from task import generate_trials, load_params as load_task_params
 
 
 # ── numpy LeakyRNN forward (mirrors network.LeakyRNN) ─────────────────────────
@@ -73,6 +73,19 @@ def dprime(a, b):
     return np.divide(diff, pooled, out=np.zeros_like(diff), where=pooled > 1e-12)
 
 
+def behavioral_dprime(hit, fa, eps=1e-4):
+    """
+    Behavioural d' = Z(hit rate) - Z(false-alarm rate), Z = inverse Gaussian CDF
+    (see dprime_test.ipynb).  Rates are clipped to [eps, 1 - eps] first, so a perfect
+    performance (hit 1, FA 0) gives d' = 2 * Z(1 - eps) = 7.43 for eps = 1e-4, the same
+    convention as the post-transfer evaluation in the transfer notebooks.
+    Unlike the correct rate, d' does not saturate at 1.
+    """
+    h = np.clip(hit, eps, 1 - eps)
+    f = np.clip(fa, eps, 1 - eps)
+    return norm.ppf(h) - norm.ppf(f)
+
+
 def auc(a, b):
     """ROC AUC per column (Mann-Whitney U), P(go > nogo) with ties = 0.5."""
     n1, n2 = len(a), len(b)
@@ -95,13 +108,50 @@ def auc_perm_p(a, b, n_perm, rng):
 
 # ── per-task analysis ─────────────────────────────────────────────────────────
 
+def _geometry():
+    """
+    Go-cue-aligned frame for the timing generate_trials uses (task_params.json).
+
+    Every trial has its own pre-stimulus time (trial.stim_on is a (batch,) array), so
+    simulated arrays are cut to a common window around each trial's own stimulus
+    onset, like train.evaluate_training: fixed_pre steps before the onset (the
+    minimum guaranteed by pre_stim_range_ms) and fixed_post steps from the onset on.
+    In the aligned frame the stimulus onset is index fixed_pre for every trial.
+    """
+    t = load_task_params()['timing']
+    dt = t['dt']
+    pulse_steps = max(1, int(np.ceil(t['pulse_dur_ms'] / dt)))
+    pre_range = t.get('pre_stim_range_ms', [t['pre_stim_dur_ms']] * 2)
+    fixed_pre = int(min(pre_range) / dt)
+    stim_dur = t['n_pulses'] * pulse_steps
+    fixed_post = stim_dur + int(t['post_stim_dur_ms'] / dt)
+    return dict(dt=dt, fixed_pre=fixed_pre, fixed_post=fixed_post,
+                aligned_tdim=fixed_pre + fixed_post,
+                stim_on=fixed_pre, stim_off=fixed_pre + stim_dur)
+
+
+def _align_to_cue(arr, stim_on, geo):
+    """Cut (T, B, ...) to (aligned_tdim, B, ...) around each trial's own stimulus onset."""
+    arr = np.asarray(arr)
+    so = np.broadcast_to(np.asarray(stim_on), (arr.shape[1],))
+    if so.min() < geo['fixed_pre'] or so.max() + geo['fixed_post'] > arr.shape[0]:
+        raise ValueError(f'stim_on in [{so.min()}, {so.max()}] does not fit the aligned '
+                         f'window (pre={geo["fixed_pre"]}, post={geo["fixed_post"]}, '
+                         f'T={arr.shape[0]}); task_params.json differs from the one used '
+                         f'to generate the trials?')
+    idx = so[None, :] - geo['fixed_pre'] + np.arange(geo['aligned_tdim'])[:, None]
+    return arr[idx, np.arange(arr.shape[1])[None, :]]
+
+
 def analyse_task(params, task_type, task_list, cfg, args, rng):
     trial = generate_trials(task_type, task_list, mode='random',
                             batch_size=args['n_trials'], rng=rng)
     hs = run_rnn(params, trial.x, cfg['alpha'], cfg['sigma_x'], cfg['sigma_rec'],
                  rng, cfg['activation'])
     go, nogo = trial.is_go, ~trial.is_go
-    on, off, tdim = trial.stim_on, trial.stim_off, trial.tdim
+    geo = _geometry()
+    hs = _align_to_cue(hs, trial.stim_on, geo)         # every trial on its own onset
+    on, off, tdim = geo['stim_on'], geo['stim_off'], geo['aligned_tdim']
     # evaluate on the part of the stim epoch after the response-onset pulses begin,
     # and on the post-stim (response / hold) epoch
     epochs = {'stim': (on, off), 'post_stim': (off, tdim)}
@@ -334,14 +384,23 @@ def random_init_params(n_in, hp, seed=0):
                 b_out=np.zeros(1))
 
 
+_STEP0_REPORTED = set()      # model dirs whose step-0 source was already printed
+
+
 def _starting_point(model_dir, config, hp, seed):
-    """Step-0 params: checkpoint_init.pkl if present, else a random network."""
+    """Step-0 params: checkpoint_init.pkl if present, else a random network.
+    The source used is printed once per model directory."""
     init = Path(model_dir) / 'checkpoint_init.pkl'
+    first = str(model_dir) not in _STEP0_REPORTED
+    _STEP0_REPORTED.add(str(model_dir))
     if init.exists():
-        print('  step 0: using checkpoint_init.pkl')
+        if first:
+            print(f'  step 0: using checkpoint_init.pkl  [{model_dir}]')
         with open(init, 'rb') as f:
             return pickle.load(f)['params']
-    print('  step 0: no checkpoint_init.pkl, using a random network from config.json')
+    if first:
+        print(f'  step 0: NO checkpoint_init.pkl in {model_dir} -> '
+              f'using a random network built from its config.json')
     return random_init_params(config['n_in'], hp, seed=config.get('seed', 0))
 
 
@@ -359,6 +418,50 @@ def population_distance(hs, is_go, t0, t1):
     return dist, mean_abs_d
 
 
+def population_noise(hs, is_go, t0, t1):
+    """
+    Trial-to-trial noise of the population response in the window [t0, t1) and the
+    Euclidean distance expressed in units of that noise.  hs: (T, B, n) Z-scored responses
+    of the selected units (see select_units).
+
+    Each trial's response is the window average X [B x n].  Noise = within-class scatter:
+    residuals from the Go / No-Go class means, pooled over both classes,
+        var_i = sum (X_i - class mean_i)^2 / (B - 2)          (per unit)
+    Returns a dict:
+      noise_var     sum_i var_i             total variance of the population (trial-to-trial)
+      noise_sd      sqrt(noise_var)         population SD (same units as the distance);
+                                            grows with sqrt(number of units)
+      noise_sd_per_unit  noise_sd / sqrt(N) = sqrt(mean_i var_i)
+                                            population SD normalised to the number of units
+                                            (RMS single-unit SD), comparable across sessions
+                                            with different numbers of units
+      distance_per_unit  D / sqrt(N)        Euclidean distance normalised the same way
+                                            (RMS single-unit distance)
+      unit_sd_mean  mean_i sqrt(var_i)      average single-unit SD
+      distance_norm D / noise_sd            Euclidean distance in units of the population SD
+      dprime_axis   D / SD along the Go-No-Go axis
+                                            the same distance, but with the noise measured
+                                            only along the direction that separates the classes
+    """
+    X = hs[t0:t1].mean(0)                                      # (B, n) per-trial window means
+    go, nogo = X[is_go], X[~is_go]
+    d_vec = go.mean(0) - nogo.mean(0)
+    D = float(np.linalg.norm(d_vec))
+    res = np.concatenate([go - go.mean(0), nogo - nogo.mean(0)], axis=0)    # (B, n) residuals
+    dof = max(len(X) - 2, 1)
+    var_i = (res ** 2).sum(0) / dof
+    noise_var = float(var_i.sum())
+    noise_sd = float(np.sqrt(noise_var))
+    axis_sd = float(np.sqrt(((res @ (d_vec / D)) ** 2).sum() / dof)) if D > 0 else np.nan
+    n_units = X.shape[1]
+    return dict(noise_var=noise_var, noise_sd=noise_sd,
+                noise_sd_per_unit=noise_sd / np.sqrt(n_units),
+                distance_per_unit=D / np.sqrt(n_units),
+                unit_sd_mean=float(np.sqrt(var_i).mean()),
+                distance_norm=D / noise_sd if noise_sd > 0 else np.nan,
+                dprime_axis=D / axis_sd if axis_sd and axis_sd > 0 else np.nan)
+
+
 def discrimination_vs_behavior(model_dir, window_ms=None, n_trials=512, seed=0,
                                save=True, show=False, zscore='all',
                                responsive_only=True, criteria=None):
@@ -374,9 +477,12 @@ def discrimination_vs_behavior(model_dir, window_ms=None, n_trials=512, seed=0,
     ----------
     model_dir  : directory with config.json and checkpoint_<step>.pkl files
     window_ms  : (start, end) in ms relative to stimulus onset.  Default: the whole
-                 stimulus period, (0, (stim_off - stim_on) * dt), from config.json.
+                 stimulus period, (0, stimulus duration).
                  e.g. (0, 300) to exclude lick-driven activity.
-    n_trials   : trials per task per checkpoint (Go / No-Go ~50/50)
+    n_trials   : trials per task per checkpoint (Go / No-Go ~50/50).  Every trial has
+                 its own pre-stimulus time; trials are cut around their own stimulus
+                 onset (see _geometry), so all windows are relative to the onset and the
+                 responsive-unit baseline is limited to the guaranteed pre-stimulus time.
     zscore, responsive_only, criteria : see select_units.  The distance is computed
                  on Z-scored responses of responsive units, from the window-averaged
                  Go and No-Go class-mean vectors.
@@ -395,9 +501,10 @@ def discrimination_vs_behavior(model_dir, window_ms=None, n_trials=512, seed=0,
     tasks = config.get('train_task', 'pure')
     tasks = [tasks] if isinstance(tasks, str) else tasks
     dt = tp['timing']['dt']
-    stim_on, stim_off, tdim = config['stim_on'], config['stim_off'], config['tdim']
+    geo = _geometry()
+    stim_on, stim_off, tdim = geo['stim_on'], geo['stim_off'], geo['aligned_tdim']
     thresh = tp.get('response', {}).get('response_thresh', 0.5)
-    reaction_steps = min(int(2000 / dt), tdim - stim_on)
+    reaction_steps = min(int(2000 / dt), geo['fixed_post'])
 
     if window_ms is None:
         window_ms = (0, (stim_off - stim_on) * dt)
@@ -424,6 +531,8 @@ def discrimination_vs_behavior(model_dir, window_ms=None, n_trials=512, seed=0,
                                     batch_size=n_trials, rng=rng)
             hs, ys = run_rnn(params, trial.x, cfg['alpha'], cfg['sigma_x'],
                              cfg['sigma_rec'], rng, cfg['activation'], return_y=True)
+            hs = _align_to_cue(hs, trial.stim_on, geo)   # cut around each trial's own onset
+            ys = _align_to_cue(ys, trial.stim_on, geo)
             go = trial.is_go
             pre = ys[:stim_on, :, 0].max(0) if stim_on > 0 else np.zeros(n_trials)
             post = ys[stim_on:stim_on + reaction_steps, :, 0].max(0)
@@ -431,11 +540,15 @@ def discrimination_vs_behavior(model_dir, window_ms=None, n_trials=512, seed=0,
             hit, fa = float(resp[go].mean()), float(resp[~go].mean())
             z, idx = select_units(hs, stim_on, dt, zscore, responsive_only, criteria)
             dist, mad = population_distance(z, go, t0, t1)
+            nz = population_noise(z, go, t0, t1)
             rows.append(dict(task=task, step=step, hit=hit, fa=fa,
-                             correct=0.5 * (hit + 1 - fa), distance=dist,
-                             mean_abs_dprime=mad, n_units=int(len(idx))))
+                             correct=0.5 * (hit + 1 - fa),
+                             behav_dprime=float(behavioral_dprime(hit, fa)),
+                             distance=dist,
+                             mean_abs_dprime=mad, n_units=int(len(idx)), **nz))
             print(f'  step {step:6d} {task:9s} hit={hit:.2f} fa={fa:.2f} '
-                  f'correct={rows[-1]["correct"]:.2f} dist={dist:.3f} '
+                  f"correct={rows[-1]['correct']:.2f} d'={rows[-1]['behav_dprime']:.2f} dist={dist:.3f} "
+                  f'noise_sd={nz["noise_sd"]:.3f} dist/noise={nz["distance_norm"]:.2f} '
                   f'units={len(idx)}')
     if len(snapshots) < 2:
         raise FileNotFoundError(f'No checkpoint_<step>.pkl files in {model_dir}')
@@ -447,17 +560,26 @@ def discrimination_vs_behavior(model_dir, window_ms=None, n_trials=512, seed=0,
             json.dump(dict(model_dir=str(model_dir), window_ms=list(window_ms),
                            n_trials=n_trials,
                            definition=dict(zscore=zscore, responsive_only=responsive_only,
+                                           aligned_to_stim_onset=True,
+                                           noise_normalised=True, behav_dprime=True,
+                                           per_unit_normalised=True,
                                            criteria=criteria if isinstance(criteria, dict)
                                            else load_criteria(criteria)),
                            rows=rows), f, indent=2)
     plot_distance_vs_behavior(rows, tasks, window_ms, model_dir.name,
                               out_dir if save else None, show)
+    plot_distance_vs_behavior(rows, tasks, window_ms, model_dir.name,
+                              out_dir if save else None, show, xkey='distance_norm',
+                              xlabel='distance / population noise SD', tag='_norm')
     return rows
 
 
-def _simulate_checkpoint(model_dir, step, task=None, n_trials=512, seed=0):
+def _simulate_checkpoint(model_dir, step, task=None, n_trials=512, seed=0, return_y=False):
     """Load one checkpoint (step 0 falls back as in _starting_point) and simulate a
-    noisy batch of `task` trials.  Returns dict(hs, trial, task, dt, stim_on, stim_off)."""
+    noisy batch of `task` trials, cut around each trial's own stimulus onset.
+    Returns dict(hs (T_aligned, B, n), trial, task, dt, stim_on, stim_off); stim_on /
+    stim_off are indices in the aligned frame (see _geometry).  With return_y the dict
+    also has ys (T_aligned, B, 1), the network output, and geo (the aligned geometry)."""
     model_dir = Path(model_dir)
     config = _load_json(model_dir / 'config.json')
     hp = config['training']['model']
@@ -478,10 +600,17 @@ def _simulate_checkpoint(model_dir, step, task=None, n_trials=512, seed=0):
 
     trial = generate_trials(task, task_list, mode='random', batch_size=n_trials,
                             rng=np.random.default_rng(seed))
-    hs = run_rnn(params, trial.x, dt / hp['tau'], hp['sigma_x'], hp['sigma_rec'],
-                 np.random.default_rng(seed + 1), hp.get('activation', 'relu'))
-    return dict(hs=hs, trial=trial, task=task, dt=dt,
-                stim_on=config['stim_on'], stim_off=config['stim_off'])
+    out = run_rnn(params, trial.x, dt / hp['tau'], hp['sigma_x'], hp['sigma_rec'],
+                  np.random.default_rng(seed + 1), hp.get('activation', 'relu'),
+                  return_y=return_y)
+    hs, ys = out if return_y else (out, None)
+    geo = _geometry()
+    res = dict(hs=_align_to_cue(hs, trial.stim_on, geo), trial=trial, task=task, dt=dt,
+               stim_on=geo['stim_on'], stim_off=geo['stim_off'])
+    if return_y:
+        res['ys'] = _align_to_cue(ys, trial.stim_on, geo)
+        res['geo'] = geo
+    return res
 
 
 def _draw_unit_panel(ax, u, name, t, psth, psth_go, psth_nogo, res,
@@ -708,6 +837,13 @@ def time_resolved_distance(model_dir, step, task=None, n_trials=512, seed=0,
                          Go and No-Go vectors at each time step (selected units)
       diff       (T, k)  signed r_Go - r_NoGo of each selected unit
       per_neuron (T, k)  |diff|: single-neuron Euclidean distance at each time step
+      noise_sd   (T,)    population SD of the trial-to-trial scatter at each time step:
+                         sqrt(sum_i var_i(t)), var_i = within-class (Go / No-Go pooled)
+                         variance of unit i across trials
+      dist_norm  (T,)    dist / noise_sd: the distance in units of the population noise
+      noise_sd_per_unit (T,)  noise_sd / sqrt(k) and
+      dist_per_unit     (T,)  dist / sqrt(k): the same two quantities normalised to the number
+                         k of selected units (comparable across sessions / models)
       units      (k,)    indices of the selected units
       stim_ms    (on, off) stimulus onset / offset, ms from stimulus onset
       step, task, model_dir
@@ -718,8 +854,17 @@ def time_resolved_distance(model_dir, step, task=None, n_trials=512, seed=0,
     go = trial.is_go
     z, idx = select_units(hs, stim_on, dt, zscore, responsive_only, criteria)
     diff = z[:, go].mean(1) - z[:, ~go].mean(1)               # (T, k)
+    dist = np.linalg.norm(diff, axis=1)
+    # trial-to-trial noise at each time step: residuals from the class means, pooled over classes
+    ss = (((z[:, go] - z[:, go].mean(1, keepdims=True)) ** 2).sum(1)
+          + ((z[:, ~go] - z[:, ~go].mean(1, keepdims=True)) ** 2).sum(1))      # (T, k)
+    noise_sd = np.sqrt(ss.sum(1) / max(z.shape[1] - 2, 1))                      # (T,)
     return dict(t_ms=(np.arange(hs.shape[0]) - stim_on) * dt,
-                dist=np.linalg.norm(diff, axis=1),
+                dist=dist, noise_sd=noise_sd,
+                noise_sd_per_unit=noise_sd / np.sqrt(z.shape[2]),
+                dist_per_unit=dist / np.sqrt(z.shape[2]),
+                dist_norm=np.divide(dist, noise_sd, out=np.full_like(dist, np.nan),
+                                    where=noise_sd > 0),
                 diff=diff, per_neuron=np.abs(diff), units=idx,
                 stim_ms=((0, (stim_off - stim_on) * dt)),
                 step=step, task=task, model_dir=str(model_dir))
@@ -733,17 +878,19 @@ def load_saved_rows(model_dir, window_ms=None):
     model_dir = Path(model_dir)
     out_dir = model_dir / 'neuron_discrimination_vs_behavior'
     if window_ms is None:
-        config = _load_json(model_dir / 'config.json')
-        dt = config['task_params']['timing']['dt']
-        window_ms = (0, (config['stim_off'] - config['stim_on']) * dt)
+        geo = _geometry()
+        window_ms = (0, (geo['stim_off'] - geo['stim_on']) * geo['dt'])
     for p in sorted(out_dir.glob('perf_vs_distance_*.json')):
         with open(p) as f:
             saved = json.load(f)
         if np.allclose(saved['window_ms'], window_ms):
-            if 'definition' not in saved:
+            d_ = saved.get('definition', {})
+            if not (d_.get('aligned_to_stim_onset') and d_.get('noise_normalised')
+                    and d_.get('behav_dprime') and d_.get('per_unit_normalised')):
                 raise FileNotFoundError(
-                    f'{p} was saved with the old distance definition (no Z-scoring / '
-                    f'unit selection, per-step distance averaged over time). '
+                    f'{p} was saved with an old definition (no Z-scoring / unit selection, '
+                    f'trials not cut around their own stimulus onset, or without the '
+                    f"noise-normalised distance / behavioural d' columns). "
                     f'Recompute with reload = False.')
             print(f'{model_dir.name}: loaded {p.name}  (definition: '
                   f'zscore={saved["definition"]["zscore"]}, '
@@ -754,28 +901,35 @@ def load_saved_rows(model_dir, window_ms=None):
         f'Run with reload = False first.')
 
 
-def plot_distance_vs_behavior(rows, tasks, window_ms, title, out_dir=None, show=False):
-    metrics = [('correct', 'correct rate'), ('hit', 'hit rate'), ('fa', 'false-alarm rate')]
+def plot_distance_vs_behavior(rows, tasks, window_ms, title, out_dir=None, show=False,
+                              xkey='distance', xlabel='Euclidean distance, Go vs No-Go population',
+                              tag=''):
+    """Scatter of behaviour vs a distance column (xkey) of the rows, coloured by step.
+    The file is perf_vs_distance<tag>_<window>ms.png."""
+    metrics = [('correct', 'correct rate'), ('behav_dprime', "behavioural d'"),
+               ('hit', 'hit rate'), ('fa', 'false-alarm rate')]
     steps = [r['step'] for r in rows]
     norm = matplotlib.colors.Normalize(min(steps), max(steps))
-    fig, axes = plt.subplots(len(tasks), 3, figsize=(15, 4.3 * len(tasks)), squeeze=False)
+    fig, axes = plt.subplots(len(tasks), len(metrics), figsize=(5 * len(metrics), 4.3 * len(tasks)),
+                             squeeze=False)
     for i, task in enumerate(tasks):
         tr = [r for r in rows if r['task'] == task]
-        d = np.array([r['distance'] for r in tr])
+        d = np.array([r[xkey] for r in tr], dtype=float)
         for j, (k, lab) in enumerate(metrics):
             y = np.array([r[k] for r in tr])
             ax = axes[i, j]
             sc = ax.scatter(d, y, c=[r['step'] for r in tr], cmap='viridis',
                             norm=norm, s=55, edgecolor='k', lw=0.4)
-            ax.set(xlabel='Euclidean distance, Go vs No-Go population',
-                   ylabel=lab, ylim=(-0.05, 1.05))
+            ax.set(xlabel=xlabel, ylabel=lab)
+            if k != 'behav_dprime':                 # rates live in [0, 1]; d' has its own range
+                ax.set_ylim(-0.05, 1.05)
             r_txt = (f'r = {np.corrcoef(d, y)[0, 1]:.2f}'
                      if len(tr) > 2 and d.std() > 0 and y.std() > 0 else 'r = n/a')
             ax.set_title(f'{task}: {lab}   ({r_txt})')
     fig.colorbar(sc, ax=axes, label='checkpoint step (training time)', fraction=0.02)
     fig.suptitle(f'{title}  |  window {window_ms[0]}–{window_ms[1]} ms from stim onset')
     if out_dir is not None:
-        fig.savefig(out_dir / f'perf_vs_distance_{window_ms[0]}_{window_ms[1]}ms.png',
+        fig.savefig(out_dir / f'perf_vs_distance{tag}_{window_ms[0]}_{window_ms[1]}ms.png',
                     dpi=140, bbox_inches='tight')
     if show:
         plt.show()

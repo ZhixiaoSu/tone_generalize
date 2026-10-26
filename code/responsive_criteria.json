@@ -1,7 +1,7 @@
 {
     "response_window_ms": [0, 100],
     "baseline_window_ms": [-200, 0],
-    "n_sd": 2.0,
+    "n_sd": 2,
     "sd_mode": "psth",
     "description": "A unit is stimulus-responsive if its peak activity in response_window_ms (relative to stimulus onset) exceeds the mean baseline activity (baseline_window_ms) by at least n_sd standard deviations. sd_mode 'psth': mean and SD are taken over time bins of the trial-averaged response; 'trial': over all single-trial baseline values (trials x time bins)."
 }

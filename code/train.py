@@ -288,7 +288,8 @@ def transfer_train(task_type, task_list, init_params, trainable='all',
 
 def setup_training(train_task, task_list, n_steps, k, seed, save_dir=None,
                    init_params=None, trainable='all',
-                   training_params_path=None, task_params_path=None):
+                   training_params_path=None, task_params_path=None,
+                   source_step=None):
     """
     Load hyperparams, build model + train state, write config to disk.
 
@@ -304,6 +305,9 @@ def setup_training(train_task, task_list, n_steps, k, seed, save_dir=None,
     trainable    : str | list | None — saved to config['training']['model']['trainable']
     training_params_path : str | None
     task_params_path     : str | None
+    source_step  : int | None — transfer learning: checkpoint step of the source model
+                   the weights came from.  If not None, '_src<source_step>' is appended
+                   to the run's folder name (and saved in config.json).
 
     Returns
     -------
@@ -359,6 +363,8 @@ def setup_training(train_task, task_list, n_steps, k, seed, save_dir=None,
 
     subfolder = (f"{train_task}_{seed}_lr{o_hp['learning_rate']}"
                  f"_bs{t_hp['batch_size']}_noise{m_hp['sigma_x']}_nrnn{m_hp['n_rnn']}")
+    if source_step is not None:
+        subfolder += f'_src{source_step}'
     save_path = Path(save_dir or results_dir()) / train_task / subfolder
     save_path.mkdir(parents=True, exist_ok=True)
 
@@ -370,6 +376,7 @@ def setup_training(train_task, task_list, n_steps, k, seed, save_dir=None,
         'train_task': config_train_task, 'task_list': task_list,
         'n_in': n_in, 'tdim': tdim, 'stim_on': stim_on,
         'stim_off': stim_off, 'pulse_steps': pulse_steps, 'seed': seed,
+        'source_step': source_step,
         'training': hp, 'task_params': task_params,
     }
     with open(save_path / 'config.json', 'w') as f:
@@ -535,6 +542,15 @@ def evaluate_training(state, snapshots, tasks, cfg,
     rng = np.random.default_rng(seed)
     key = jax.random.PRNGKey(seed + 1)
 
+    # If checkpoint_init.pkl exists (transfer learning), prepend it as step 0
+    eval_snapshots = list(snapshots)
+    ckpt_init_path = save_path / 'checkpoint_init.pkl'
+    if ckpt_init_path.exists():
+        with open(ckpt_init_path, 'rb') as f:
+            init_ckpt = pickle.load(f)
+        eval_snapshots = [{'step': 0, 'params': init_ckpt['params'],
+                           'loss': float('nan')}] + eval_snapshots
+
     log = {'step': [], 'loss': [], 'tasks': tasks}
     for t in tasks:
         log[f'{t}_hit_rate']    = []
@@ -544,7 +560,7 @@ def evaluate_training(state, snapshots, tasks, cfg,
         log[f'{t}_traces_go']   = []
         log[f'{t}_traces_nogo'] = []
 
-    for snap in snapshots:
+    for snap in eval_snapshots:
         params = jax.tree_util.tree_map(jnp.array, snap['params'])
         log['step'].append(snap['step'])
         log['loss'].append(snap['loss'])
@@ -562,8 +578,11 @@ def evaluate_training(state, snapshots, tasks, cfg,
             is_go = trial.is_go
 
             # Align to go cue: trim a fixed window around trial.stim_on.
-            actual_so = trial.stim_on
-            ys_aln = ys[actual_so - fixed_pre : actual_so + fixed_post]  # (aligned_tdim, batch, 1)
+            stim_on_arr = trial.stim_on  # (bsize,) per-trial go cue steps
+            ys_aln = np.stack([
+                ys[so - fixed_pre : so + fixed_post, i, :]
+                for i, so in enumerate(stim_on_arr)
+            ], axis=1)  # (aligned_tdim, bsize, 1)
 
             pre  = (ys_aln[:fixed_pre, :, 0].max(axis=0) if fixed_pre > 0
                     else np.zeros(bsize))

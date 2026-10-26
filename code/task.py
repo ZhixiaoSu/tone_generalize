@@ -282,16 +282,16 @@ def generate_trials(task_type, task_list, mode='random', batch_size=32,
     post_stim_steps = int(t['post_stim_dur_ms'] / dt)
 
     if mode == 'random':
-        pre_range = t.get('pre_stim_range_ms', [t['pre_stim_dur_ms']] * 2)
-        stim_on = int(rng.uniform(*pre_range) / dt)
-        # tdim fixed at maximum pre-stim + fixed stim + fixed post-stim
-        tdim = int(max(pre_range) / dt) + stim_dur + post_stim_steps
+        pre_range   = t.get('pre_stim_range_ms', [t['pre_stim_dur_ms']] * 2)
+        stim_on_arr = (rng.uniform(*pre_range, size=batch_size) / dt).astype(int)
+        tdim        = int(max(pre_range) / dt) + stim_dur + post_stim_steps
     else:
-        stim_on = int(t['pre_stim_dur_ms'] / dt)
-        tdim    = stim_on + stim_dur + post_stim_steps
+        so          = int(t['pre_stim_dur_ms'] / dt)
+        stim_on_arr = np.full(batch_size, so, dtype=int)
+        tdim        = so + stim_dur + post_stim_steps
 
-    stim_off  = stim_on + stim_dur
-    trial_end = stim_off + post_stim_steps  # last meaningful step; tail of tdim is silent
+    stim_off_arr  = stim_on_arr + stim_dur
+    trial_end_arr = stim_off_arr + post_stim_steps
 
     grid_hz, vectors = get_stimulus_vectors(task_list, params)
     n_freq = len(grid_hz)
@@ -304,23 +304,23 @@ def generate_trials(task_type, task_list, mode='random', batch_size=32,
     labels       = []
     is_go        = np.zeros(batch_size, dtype=bool)
 
-    # fixation channel (index n_freq): 1 before stim onset, 0 after
-    trial.x[:stim_on, :, n_freq] = 1.0
-
     # context one-hot (indices n_freq+1 : n_freq+1+N_CONTEXT): constant for whole trial
     ctx = CONTEXT_MAP.get(task_type, np.zeros(N_CONTEXT, dtype='float32'))
     trial.x[:, :, n_freq + 1 : n_freq + 1 + N_CONTEXT] = ctx
 
     def _fill_go(i):
-        """Fill trial i with n_pulses alternating Go spectra, stim period only."""
-        for step in range(stim_on, stim_off):
-            pulse_idx = (step - stim_on) // pulse_steps
+        so = stim_on_arr[i]
+        trial.x[:so, i, n_freq] = 1.0  # fixation on before stim
+        for step in range(so, so + stim_dur):
+            pulse_idx = (step - so) // pulse_steps
             lbl = go_labels[pulse_idx % len(go_labels)]
             trial.x[step, i, :n_freq] = vectors[lbl]
-        trial.y[stim_on + resp_onset_pulses * pulse_steps :, i, 0] = 1.0
+        trial.y[so + resp_onset_pulses * pulse_steps :, i, 0] = 1.0
 
     def _fill_nogo(i, label):
-        trial.x[stim_on:stim_off, i, :n_freq] = vectors[label]
+        so = stim_on_arr[i]
+        trial.x[:so, i, n_freq] = 1.0  # fixation on before stim
+        trial.x[so : so + stim_dur, i, :n_freq] = vectors[label]
 
     if mode == 'random':
         for i in range(batch_size):
@@ -354,19 +354,20 @@ def generate_trials(task_type, task_list, mode='random', batch_size=32,
         raise ValueError(f"Unknown mode '{mode}'. Choose 'random' or 'test'.")
 
     # Loss mask: 1.0 everywhere, 5.0 during the response period (after grace).
-    # Shape (tdim, 1) broadcasts over (tdim, batch, 1) ys arrays.
-    mask = np.ones((tdim, 1, 1), dtype='float32')
-    mask[stim_on + resp_onset_pulses * pulse_steps:, 0, 0] = 5.0
+    # Shape (tdim, batch_size, 1) with per-trial response onset.
+    mask = np.ones((tdim, batch_size, 1), dtype='float32')
+    for i in range(batch_size):
+        mask[stim_on_arr[i] + resp_onset_pulses * pulse_steps:, i, 0] = 5.0
     trial.mask = mask
 
-    trial.stim_on   = stim_on
-    trial.stim_off  = stim_off
-    trial.trial_end = trial_end
+    trial.stim_on   = stim_on_arr   # shape (batch_size,)
+    trial.stim_off  = stim_off_arr  # shape (batch_size,)
+    trial.trial_end = trial_end_arr
     trial.tdim      = tdim
     trial.epochs    = {
-        'pre_stim':  (0,         stim_on),
-        'stim':      (stim_on,   stim_off),
-        'post_stim': (stim_off,  trial_end),
+        'pre_stim_range': stim_on_arr,
+        'stim_dur':       stim_dur,
+        'post_stim':      post_stim_steps,
     }
     trial.grid_hz = grid_hz
     trial.labels  = labels
@@ -380,10 +381,11 @@ if __name__ == '__main__':
     task_list = ['pure', 'harmonic', 'wn']
     for task_type in task_list:
         trial = generate_trials(task_type, task_list, mode='test', batch_size=6)
+        so0 = trial.stim_on[0]
         print(f'{task_type:10s}  n_freq={len(trial.grid_hz):3d}  '
               f'tdim={trial.tdim}  '
-              f'stim_on={trial.stim_on}  '
+              f'stim_on[0]={so0}  '
               f'go={trial.is_go.tolist()}')
         print(f'  labels: {trial.labels}')
-        print(f'  x[stim_on, 0, :5] = {trial.x[trial.stim_on, 0, :5]}')
-        print(f'  y[stim_on, :, 0]  = {trial.y[trial.stim_on, :, 0]}')
+        print(f'  x[stim_on[0], 0, :5] = {trial.x[so0, 0, :5]}')
+        print(f'  y[stim_on[0], :, 0]  = {trial.y[so0, :, 0]}')
